@@ -22,7 +22,7 @@ async fn setup_apikey() -> Result<String, Box<dyn std::error::Error>> {
     let apikey = fs::read_to_string(&api_path).await?;
 
     if apikey.trim().is_empty() {
-        return Err("❌ API key is empty. Please set your API key in .config/fofa_apikey".into());
+        return Err("❌ API key is empty. Please set your API key in ~/.config/fofa_apikey".into());
     }
 
     println!("✅ API key loaded successfully");
