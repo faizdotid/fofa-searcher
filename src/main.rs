@@ -1,132 +1,121 @@
+use base64::prelude::*;
+use clap::Parser;
+use std::path::PathBuf;
+use tokio::fs;
+use tokio::io::AsyncWriteExt;
+
 mod deserializer;
 mod searcher;
-use base64::prelude::*;
-use searcher::fofa_searcher::{self, SearchError, Searcher};
-use std::{ops::Index, path::PathBuf};
-use tokio::{fs, io::AsyncWriteExt};
 
-async fn setup_apikey() -> Result<String, Box<dyn std::error::Error>> {
-    let config_dir = PathBuf::from(".config");
-    let api_path = config_dir.join("fofa_apikey");
+use searcher::FofaSearcher;
+
+const DEFAULT_THREADS: u8 = 5;
+
+#[derive(Parser, Debug)]
+#[command(
+    name = "fofa-searcher",
+    about = "FOFA API CLI searcher",
+    version = "0.2.0"
+)]
+struct Args {
+    /// FOFA search query
+    #[arg(short, long)]
+    query: String,
+
+    /// Output file path
+    #[arg(short, long, default_value = "output.txt")]
+    output: PathBuf,
+
+    /// Concurrent threads
+    #[arg(short, long, default_value_t = DEFAULT_THREADS)]
+    threads: u8,
+}
+
+async fn load_api_key() -> Result<String, Box<dyn std::error::Error>> {
+    let config_dir = dirs::config_dir()
+        .ok_or("could not determine config directory")?
+        .join("fofa-searcher");
+
+    let api_path = config_dir.join("apikey");
 
     if !config_dir.exists() {
-        println!("📁 Creating config directory...");
-        fs::create_dir(&config_dir).await?;
+        println!("📁 Creating config directory at {}…", config_dir.display());
+        fs::create_dir_all(&config_dir).await?;
     }
 
     if !api_path.exists() {
-        println!("📄 Creating API key file...");
+        println!("📄 Creating API key file…");
         fs::write(&api_path, "").await?;
     }
 
     let apikey = fs::read_to_string(&api_path).await?;
 
     if apikey.trim().is_empty() {
-        return Err("❌ API key is empty. Please set your API key in ~/.config/fofa_apikey".into());
+        return Err(format!(
+            "❌ API key is empty. Set it in {}",
+            api_path.display()
+        )
+        .into());
     }
 
-    println!("✅ API key loaded successfully");
+    println!("✅ API key loaded");
     Ok(apikey.trim().to_string())
-}
-
-fn print_help() {
-    println!("\n📚 Available Commands:");
-    println!("- Enter your FOFA search query");
-    println!("- Type 'help' to show this help message");
-    println!("- Press Enter with empty query to exit or type 'exit'");
-    println!("\n💡 Example Queries:");
-    println!("domain=\"example.com\"");
-    println!("header=\"nginx\"");
-    println!("protocol==\"http\" && country==\"US\"");
-    println!();
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("\n🔍 FOFA Search CLI");
+    let args = Args::parse();
 
-    let apikey = match setup_apikey().await {
+    let apikey = match load_api_key().await {
         Ok(key) => key,
         Err(e) => {
-            eprintln!("{}", e);
+            eprintln!("{e}");
             std::process::exit(1);
         }
     };
 
-    let searcher = fofa_searcher::FofaSearcher::new(&apikey, 5);
-    print_help();
+    let searcher = FofaSearcher::new(&apikey, args.threads);
+    let b64 = BASE64_STANDARD.encode(args.query.as_bytes());
 
-    let mut outfile = tokio::fs::OpenOptions::new()
+    println!("🚀 Searching for: {}", args.query);
+
+    let results = match searcher.search(&b64).await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("❌ Search failed: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    let total = results.iter().map(|r| r.size).sum::<u32>();
+    println!("\n📊 Total results: {} across {} pages", total, results.len());
+
+    let mut file = tokio::fs::OpenOptions::new()
         .create(true)
         .write(true)
         .truncate(true)
-        .open("output.txt")
+        .open(&args.output)
         .await?;
 
-    loop {
-        print!("\n🤔 Query> ");
-        std::io::Write::flush(&mut std::io::stdout())?;
-
-        let mut query = String::new();
-        std::io::stdin().read_line(&mut query)?;
-        let query = query.trim();
-
-        match query {
-            "exit" => {
-                println!("👋 Exiting...");
-                break;
-            }
-            "help" => {
-                print_help();
-                continue;
-            }
-            _ => {
-                println!("\n🚀 Searching for: {}", query);
-                let base64_query = BASE64_STANDARD.encode(query.as_bytes());
-                let results = searcher.search(&base64_query).await;
-
-                if let Err(ref e) = results {
-                    eprintln!(
-                        "❌ Error: {}",
-                        match e {
-                            SearchError::RequestError(e) => format!("Request failed: {}", e),
-                            SearchError::JsonError(e) => format!("Failed to parse response: {}", e),
-                            SearchError::LimitExceeded(e) => format!("Rate limit exceeded: {}", e),
-                            SearchError::InvalidQuery => "Invalid query format".to_string(),
-                            SearchError::SemaphoreError => "Internal concurrency error".to_string(),
-                        }
-                    );
-                }
-
-                if let Ok(ref results) = results {
-                    println!("\n📊 Search Results:");
-                    println!(
-                        "   Total Results: {}",
-                        results.iter().map(|r| r.size).sum::<u32>()
-                    );
-                    println!("   Total Pages: {}", results.len());
-                    for (_i, result) in results.iter().enumerate() {
-                        for (_j, entry) in result.results.iter().enumerate() {
-                            // tokio::fs::write(&outfile, format!("{}\n", entry.index(0))).await?;
-                            outfile
-                                .write_all(
-                                    format!(
-                                        "{}\n",
-                                        if !entry.index(0).contains("http") {
-                                            format!("http://{}", entry.index(0))
-                                        } else {
-                                            entry.index(0).to_string()
-                                        }
-                                    )
-                                    .as_bytes(),
-                                )
-                                .await?;
-                        }
-                    }
-                }
-            }
+    let mut written = 0usize;
+    for response in &results {
+        for entry in &response.results {
+            let raw = &entry[0];
+            let normalized = normalize_url(raw);
+            file.write_all(format!("{normalized}\n").as_bytes()).await?;
+            written += 1;
         }
     }
 
+    file.flush().await?;
+    println!("💾 Saved {written} URLs to {}", args.output.display());
+
     Ok(())
+}
+
+fn normalize_url(raw: &str) -> String {
+    if raw.starts_with("http://") || raw.starts_with("https://") {
+        return raw.to_string();
+    }
+    format!("http://{raw}")
 }
