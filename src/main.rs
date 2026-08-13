@@ -27,7 +27,7 @@ struct Args {
     output: PathBuf,
 
     /// Concurrent threads
-    #[arg(short, long, default_value_t = DEFAULT_THREADS)]
+    #[arg(short, long, default_value_t = DEFAULT_THREADS, value_parser = clap::value_parser!(u8).range(1..))]
     threads: u8,
 }
 
@@ -87,8 +87,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    let total = results.iter().map(|r| r.size).sum::<u32>();
-    println!("\n📊 Total results: {} across {} pages", total, results.len());
+    let total = results.first().map_or(0, |r| r.size);
+    println!(
+        "\n📊 Total results: {} across {} pages",
+        total,
+        results.len()
+    );
 
     let mut file = tokio::fs::OpenOptions::new()
         .create(true)
@@ -97,13 +101,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .open(&args.output)
         .await?;
 
+    let mut seen = std::collections::HashSet::new();
     let mut written = 0usize;
     for response in &results {
         for entry in &response.results {
-            let raw = &entry[0];
+            let Some(raw) = entry.first() else {
+                continue;
+            };
             let normalized = normalize_url(raw);
-            file.write_all(format!("{normalized}\n").as_bytes()).await?;
-            written += 1;
+            if seen.insert(normalized.clone()) {
+                file.write_all(format!("{normalized}\n").as_bytes()).await?;
+                written += 1;
+            }
         }
     }
 

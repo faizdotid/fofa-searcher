@@ -1,22 +1,12 @@
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 pub struct SearchResponse {
     pub error: bool,
-    pub consumed_fpoint: u8,
-    pub required_fpoints: u8,
-    pub tip: String,
-    pub size: u32,
-    pub page: u32,
-    pub mode: String,
-    pub query: String,
-    pub results: Vec<[String; 3]>,
-}
-
-#[derive(Debug, Deserialize)]
-#[allow(dead_code)]
-pub struct ErrorResponse {
-    pub error: bool,
+    #[serde(default)]
     pub errmsg: String,
+    #[serde(default)]
+    pub size: u32,
+    #[serde(default)]
+    pub results: Vec<Vec<String>>,
 }

@@ -1,4 +1,4 @@
-use crate::deserializer::{ErrorResponse, SearchResponse};
+use crate::deserializer::SearchResponse;
 use futures::future::join_all;
 use reqwest::StatusCode;
 use std::time::Duration;
@@ -9,14 +9,17 @@ const RESULTS_PER_PAGE: u32 = 100;
 const MAX_RETRIES: u32 = 3;
 const RATE_LIMIT_SLEEP_SECS: u64 = 5;
 const RETRY_BACKOFF_SECS: u64 = 2;
+const REQUEST_TIMEOUT_SECS: u64 = 30;
 
 #[derive(Debug)]
 pub enum SearchError {
     Request(reqwest::Error),
     Json(serde_json::Error),
+    Api(String),
     LimitExceeded(String),
     InvalidQuery,
     Semaphore,
+    PartialFailure { failed: u32, total: u32 },
 }
 
 impl From<reqwest::Error> for SearchError {
@@ -36,9 +39,13 @@ impl std::fmt::Display for SearchError {
         match self {
             SearchError::Request(e) => write!(f, "request failed: {e}"),
             SearchError::Json(e) => write!(f, "json parse failed: {e}"),
+            SearchError::Api(msg) => write!(f, "api error: {msg}"),
             SearchError::LimitExceeded(msg) => write!(f, "rate limit: {msg}"),
             SearchError::InvalidQuery => write!(f, "invalid query format"),
             SearchError::Semaphore => write!(f, "internal concurrency error"),
+            SearchError::PartialFailure { failed, total } => {
+                write!(f, "{failed} of {total} pages failed to fetch")
+            }
         }
     }
 }
@@ -62,6 +69,7 @@ impl FofaSearcher {
         let client = reqwest::ClientBuilder::new()
             .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
             .default_headers(headers)
+            .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
             .build()
             .expect("build http client");
 
@@ -79,12 +87,8 @@ impl FofaSearcher {
             .rate_limited_get(self.build_uri(query, 1), Some(1))
             .await?;
 
-        if initial.error {
-            return Err(SearchError::InvalidQuery);
-        }
-
         let total_size = initial.size;
-        let total_pages = (total_size + RESULTS_PER_PAGE - 1) / RESULTS_PER_PAGE;
+        let total_pages = total_size.div_ceil(RESULTS_PER_PAGE);
 
         println!("\n📊 Statistics: {} results, {} pages", total_size, total_pages);
 
@@ -101,11 +105,22 @@ impl FofaSearcher {
                 })
                 .collect();
 
+            let mut failed = 0u32;
             for response in join_all(futures).await {
                 match response {
                     Ok(r) => results.push(r),
-                    Err(e) => eprintln!("❌ Error processing response: {e}"),
+                    Err(e) => {
+                        failed += 1;
+                        eprintln!("❌ Error processing response: {e}");
+                    }
                 }
+            }
+
+            if failed > 0 {
+                return Err(SearchError::PartialFailure {
+                    failed,
+                    total: total_pages,
+                });
             }
         }
 
@@ -139,13 +154,15 @@ impl FofaSearcher {
         for attempt in 1..=MAX_RETRIES {
             match self.get(&uri).await {
                 Ok(resp) => return Ok(resp),
-                Err(SearchError::LimitExceeded(msg)) => {
-                    eprintln!("⏳ Rate limited ({attempt}/{MAX_RETRIES}): {msg}");
+                Err(e @ (SearchError::LimitExceeded(_) | SearchError::Request(_))) => {
+                    eprintln!("⏳ Attempt {attempt}/{MAX_RETRIES} failed: {e}");
                     if attempt < MAX_RETRIES {
                         sleep(Duration::from_secs(
                             RATE_LIMIT_SLEEP_SECS + (attempt as u64 * RETRY_BACKOFF_SECS),
                         ))
                         .await;
+                    } else {
+                        return Err(e);
                     }
                 }
                 Err(e) => return Err(e),
@@ -166,11 +183,11 @@ impl FofaSearcher {
             StatusCode::BAD_REQUEST | StatusCode::NOT_FOUND => Err(SearchError::InvalidQuery),
             _ => {
                 let text = response.text().await?;
-                if text.contains("errmsg") {
-                    let err: ErrorResponse = serde_json::from_str(&text)?;
-                    return Err(SearchError::LimitExceeded(err.errmsg));
+                let parsed: SearchResponse = serde_json::from_str(&text)?;
+                if parsed.error {
+                    return Err(SearchError::Api(parsed.errmsg));
                 }
-                Ok(serde_json::from_str(&text)?)
+                Ok(parsed)
             }
         }
     }

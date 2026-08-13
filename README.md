@@ -5,7 +5,7 @@ Concurrent FOFA API searcher built with Rust and Tokio.
 ## Features
 
 - Async concurrent page fetching with semaphore
-- Automatic retry with exponential backoff on rate limits
+- Automatic retry with exponential backoff on rate limits and transient network errors
 - CLI interface with `clap`
 - Config stored in OS config directory (`~/.config/fofa-searcher/apikey`)
 - URL normalization (auto-prefix `http://`)
